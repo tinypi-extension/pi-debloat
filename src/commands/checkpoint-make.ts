@@ -14,7 +14,7 @@ import {
   truncateBody,
   validateCheckpoints,
 } from "../llm.js";
-import { buildLookbackWindow, sanitizeBoundaries } from "../ranges.js";
+import { buildLookbackWindow, MIN_WINDOW_MESSAGES, sanitizeBoundaries } from "../ranges.js";
 import { loadSettings, resolveSettings } from "../settings.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
@@ -73,9 +73,9 @@ export async function runCheckpointMake(
     const entries = ctx.sessionManager.getBranch() as unknown as EntryLike[];
     const state = deriveState(entries);
     const window = buildLookbackWindow(entries, state, settings.maxLookbackTokens);
-    if (window.entries.length < 2) {
+    if (window.entries.length < MIN_WINDOW_MESSAGES) {
       ctx.ui.notify(
-        "Debloat: nothing to checkpoint — fewer than 2 messages in the lookback window.",
+        `Debloat: nothing to checkpoint — fewer than ${MIN_WINDOW_MESSAGES} messages in the lookback window.`,
         "info",
       );
       return;

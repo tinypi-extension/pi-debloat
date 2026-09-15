@@ -130,14 +130,31 @@ export function parseJsonOutput<T = unknown>(
   }
 }
 
+/**
+ * Models routinely wrap the plan in a `{"checkpoints": [...]}` object even
+ * though the prompt asks for a bare array, and occasionally emit a single
+ * checkpoint object with no array at all. Normalize those two shapes before
+ * validating so a well-formed plan is not discarded on packaging alone.
+ */
+function normalizeCheckpointPlan(value: unknown): unknown {
+  if (isRecord(value)) {
+    if ("checkpoints" in value) return value.checkpoints;
+    if (nonEmptyString(value.afterEntryId) && nonEmptyString(value.label)) return [value];
+  }
+  return value;
+}
+
 /** Validate the judge's checkpoint plan; a string result is an error message. */
 export function validateCheckpoints(
   value: unknown,
 ): { afterEntryId: string; label: string }[] | string {
-  if (!Array.isArray(value)) return "expected a JSON array of checkpoints";
+  const plan = normalizeCheckpointPlan(value);
+  if (!Array.isArray(plan)) {
+    return 'expected a JSON array of checkpoints, e.g. [{"afterEntryId": "<node id>", "label": "<kebab-case label>"}]';
+  }
   const checkpoints: CheckpointOutput[] = [];
-  for (let i = 0; i < value.length; i++) {
-    const item = value[i];
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i];
     if (!isRecord(item)) return `checkpoint ${i} is not an object`;
     if (!nonEmptyString(item.afterEntryId)) {
       return `checkpoint ${i} has a missing or empty afterEntryId`;

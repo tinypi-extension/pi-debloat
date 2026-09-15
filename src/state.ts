@@ -9,7 +9,7 @@
 export interface MessageLike {
   role: string;
   content?: unknown;
-  usage?: { totalTokens?: number; [k: string]: unknown };
+  usage?: { totalTokens?: number; output?: number; [k: string]: unknown };
   timestamp?: number;
   [k: string]: unknown;
 }

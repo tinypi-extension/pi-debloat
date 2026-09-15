@@ -78,7 +78,7 @@ Defaults: thinking levels `low`, `maxLookbackTokens` 100000. A key present in th
 
 ### D5 — Token budget for `/checkpoint-make`
 
-Walk backwards from the current leaf accumulating per-message token estimates (message `usage` when present, `≈ chars/4` fallback) until `maxLookbackTokens` is reached. The window starts at the logical position of the most recent active checkpoint if one exists (its `afterEntryId`), otherwise at session start.
+Walk backwards from the current leaf accumulating **per-message** token estimates until `maxLookbackTokens` is reached, always keeping at least 2 messages when that many are eligible (a boundary needs one message on each side). Each message is charged its own size — `usage.output` when present, `≈ chars/4` fallback — never `usage.totalTokens`, which pi sets to the cumulative request total and which would let one assistant message consume the whole budget. The window starts at the logical position of the most recent active checkpoint if one exists (its `afterEntryId`), otherwise at session start.
 
 ## Commands
 
@@ -86,7 +86,7 @@ Walk backwards from the current leaf accumulating per-message token estimates (m
 |---|---|
 | `/checkpoint-make` | Build lookback window (D5). If window has no placeable messages → notify. One-shot call with `find-checkpoint.md`. Validate returned boundaries (valid entry ids, cut-point rules: never split a user→toolResult pair, boundaries strictly after any existing checkpoint positions and before current). Append `debloat-checkpoint` entries. Notify with placed count + labels. |
 | `/compact-checkpoint` | If no active checkpoints → notify "no checkpoints, run /checkpoint-make first". Determine spans: oldest uncompacted checkpoint → latest checkpoint; compact each span sequentially (one LLM call per span, `compact.md` prompt). Append `debloat-compaction` entry per span. Newest span (latest checkpoint → current) is never compacted. Show progress per span. |
-| `/debloat settings` | Dialog sequence: pick checkpoint model → checkpoint thinking level → compact model → compact thinking level → lookback token count. Saves to D4 file. |
+| `/debloat settings` | TUI: one settings table (label → current value) that edits all values in place — checkpoint/compact model pickers, thinking levels, lookback tokens — staged until “Save & exit”; Esc cancels without writing. Non-TUI (RPC/print): the sequential picker dialogs as a fallback. Saves to D4 file. |
 | `/debloat timeline` | Render list: checkpoints in logical order with labels, compaction titles per span, stale/consumed marks, tombstone state. |
 | `/debloat remove-checkpoints` | Confirm dialog → append `debloat-tombstone` → notify count removed. Compaction summaries unaffected. |
 | `/debloat` (no args) | Show usage summary of the subcommands. |

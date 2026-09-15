@@ -68,7 +68,7 @@ Return **only JSON**, no prose, no code fences:
 
 - `title`: kebab-case, names the state the span *reached*, using the session's own
   vocabulary. Same rules as checkpoint labels — a phrase a human would say out loud.
-- `summary`: compact prose (aim under ~250 words unless the span demands more).
+- `summary`: compact prose (aim under ~400 words unless the span demands more).
   Structure it in this order:
   1. **Outcome** — one or two sentences: what happened in this span.
   2. **Decisions** — constraints later turns must respect.

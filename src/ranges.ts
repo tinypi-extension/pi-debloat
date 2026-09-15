@@ -158,12 +158,20 @@ export function sanitizeBoundaries(
   return accepted;
 }
 
-/** `usage.totalTokens` when it is finite and positive, else ceil(chars / 4). */
+/**
+ * Per-message token cost: the message's **own** size, never the whole request.
+ *
+ * `usage.totalTokens` is the cumulative request total (input + cache + output for
+ * the entire context at the moment the message was produced), so charging it per
+ * message lets one assistant entry exhaust the whole lookback budget. Only
+ * `usage.output` — the tokens this message itself contributes — is used;
+ * everything else falls back to `ceil(chars / 4)`.
+ */
 export function estimateTokens(message: MessageLike | undefined): number {
   if (!message || typeof message !== "object") return 0;
-  const totalTokens = message.usage?.totalTokens;
-  if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
-    return totalTokens;
+  const output = message.usage?.output;
+  if (typeof output === "number" && Number.isFinite(output) && output > 0) {
+    return output;
   }
   let chars = 0;
   try {
@@ -175,6 +183,9 @@ export function estimateTokens(message: MessageLike | undefined): number {
   return Math.ceil(chars / 4);
 }
 
+/** Minimum messages the judge needs to place a boundary between two of them. */
+export const MIN_WINDOW_MESSAGES = 2;
+
 /**
  * Newest-first token-capped window over message entries.
  *
@@ -183,7 +194,8 @@ export function estimateTokens(message: MessageLike | undefined): number {
  * cut point, or null for session start. Messages pi no longer sends (at or
  * before the native cut) and messages inside an accepted compaction are never
  * included. The newest message is always kept even if it alone crosses the cap,
- * so the judge always sees the head.
+ * and at least `MIN_WINDOW_MESSAGES` messages are kept whenever that many are
+ * eligible, so the judge always has something to bound.
  */
 export function buildLookbackWindow(
   entries: readonly EntryLike[],
@@ -239,7 +251,9 @@ export function buildLookbackWindow(
     const entry = eligible[i]!;
     tokens += estimateTokens(entry.message);
     kept.push(entry);
-    if (tokens > maxTokens) break;
+    // A boundary needs one message on each side, so a single oversized message
+    // must never be the whole window.
+    if (tokens > maxTokens && kept.length >= MIN_WINDOW_MESSAGES) break;
   }
   kept.reverse();
 

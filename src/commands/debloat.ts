@@ -7,12 +7,25 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Input, SelectList, SettingsList } from "@earendil-works/pi-tui";
+import type { AutocompleteItem, Component, SettingItem } from "@earendil-works/pi-tui";
+import {
+  getSelectListTheme,
+  getSettingsListTheme,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 
 import { currentLeafId, errorText, readState } from "../pi-glue.js";
 import { computeSpans } from "../ranges.js";
-import { loadSettings, resolveSettings, saveSettings, type ModelRef } from "../settings.js";
+import {
+  loadSettings,
+  resolveSettings,
+  saveSettings,
+  type DebloatSettings,
+  type ModelRef,
+  type ResolvedSettings,
+} from "../settings.js";
 import { TOMBSTONE_CUSTOM_TYPE, type DebloatState } from "../state.js";
 
 export const DEBLOAT_SUBCOMMANDS = ["settings", "timeline", "remove-checkpoints"] as const;
@@ -82,8 +95,250 @@ function defaultSettingsFile(): string {
     : path.join(home, ".pi", "agent", "debloat.json");
 }
 
-/** Sequential settings dialogs; cancelling any dialog aborts without writes. */
-async function runSettings(ctx: ExtensionCommandContext): Promise<void> {
+/* ---------------------------------------------------- settings: shared helpers */
+
+/** Stage one table edit into `patch`; unknown ids / unparseable values are ignored. */
+export function applySettingChange(patch: DebloatSettings, id: string, value: string): void {
+  switch (id) {
+    case "checkpoint-model": {
+      const ref = parseModelChoice(value);
+      if (ref) patch.checkpointModel = ref;
+      return;
+    }
+    case "compact-model": {
+      const ref = parseModelChoice(value);
+      if (ref) patch.compactModel = ref;
+      return;
+    }
+    case "checkpoint-thinking":
+      patch.checkpointThinkingLevel = value;
+      return;
+    case "compact-thinking":
+      patch.compactThinkingLevel = value;
+      return;
+    case "lookback-tokens": {
+      const tokens = parseTokenChoice(value);
+      if (tokens !== undefined) patch.maxLookbackTokens = tokens;
+      return;
+    }
+  }
+}
+
+/**
+ * The SettingsList rows: label on the left, current value on the right. Rows
+ * with `values` cycle in place; rows with `submenu` open a picker. `save` is the
+ * only row whose activation writes anything.
+ */
+export function settingsTableItems(
+  current: ResolvedSettings,
+  available: string[],
+  notifyError: (message: string) => void,
+): SettingItem[] {
+  return [
+    {
+      id: "checkpoint-model",
+      label: "Checkpoint model",
+      description: "Model that places checkpoints (/checkpoint-make)",
+      currentValue: modelLabel(current.checkpointModel),
+      submenu: (value, done) => new ModelSubmenu(available, value, done),
+    },
+    {
+      id: "checkpoint-thinking",
+      label: "Checkpoint thinking",
+      description: "Reasoning level for boundary placement",
+      currentValue: current.checkpointThinkingLevel,
+      values: [...THINKING_LEVELS],
+    },
+    {
+      id: "compact-model",
+      label: "Compact model",
+      description: "Model that writes span summaries (/compact-checkpoint)",
+      currentValue: modelLabel(current.compactModel),
+      submenu: (value, done) => new ModelSubmenu(available, value, done),
+    },
+    {
+      id: "compact-thinking",
+      label: "Compact thinking",
+      description: "Reasoning level for span summaries",
+      currentValue: current.compactThinkingLevel,
+      values: [...THINKING_LEVELS],
+    },
+    {
+      id: "lookback-tokens",
+      label: "Max lookback tokens",
+      description: "How much recent context /checkpoint-make scans",
+      currentValue: String(current.maxLookbackTokens),
+      submenu: (value, done) => new TokenSubmenu(value, done, notifyError),
+    },
+    {
+      id: "save",
+      label: "Save & exit",
+      description: "Write settings and close (Esc cancels without writing)",
+      currentValue: "press Enter to save",
+      values: ["save"],
+    },
+  ];
+}
+
+/** Model picker: Enter selects the highlighted `provider/id`, Escape keeps current. */
+class ModelSubmenu implements Component {
+  private readonly list: SelectList;
+
+  constructor(available: string[], currentValue: string, done: (value?: string) => void) {
+    const items = available.map((value) => ({ value, label: value }));
+    this.list = new SelectList(items, Math.min(items.length, 15), getSelectListTheme());
+    const index = items.findIndex((item) => item.value === currentValue);
+    if (index >= 0) this.list.setSelectedIndex(index);
+    this.list.onSelect = (item) => done(item.value);
+    this.list.onCancel = () => done();
+  }
+
+  render(width: number): string[] {
+    return this.list.render(width);
+  }
+
+  invalidate(): void {
+    this.list.invalidate();
+  }
+
+  handleInput(data: string): void {
+    this.list.handleInput(data);
+  }
+}
+
+/**
+ * Token picker: preset list plus an in-place numeric Input for the "custom…"
+ * entry. Escape from the Input drops back to the preset list.
+ */
+class TokenSubmenu implements Component {
+  private readonly list: SelectList;
+  private input: Input | null = null;
+
+  constructor(
+    currentValue: string,
+    done: (value?: string) => void,
+    notifyError: (message: string) => void,
+  ) {
+    const items = [
+      ...TOKEN_CHOICES.map((value) => ({ value: String(value), label: String(value) })),
+      { value: CUSTOM_TOKENS, label: CUSTOM_TOKENS },
+    ];
+    this.list = new SelectList(items, items.length, getSelectListTheme());
+    const index = items.findIndex((item) => item.value === currentValue);
+    if (index >= 0) this.list.setSelectedIndex(index);
+    this.list.onSelect = (item) => {
+      if (item.value !== CUSTOM_TOKENS) {
+        done(item.value);
+        return;
+      }
+      this.showCustomInput(currentValue, done, notifyError);
+    };
+    this.list.onCancel = () => done();
+  }
+
+  private showCustomInput(
+    currentValue: string,
+    done: (value?: string) => void,
+    notifyError: (message: string) => void,
+  ): void {
+    const input = new Input({ prompt: "Max lookback tokens: " });
+    input.setValue(currentValue);
+    input.onSubmit = (value) => {
+      const parsed = parseTokenChoice(value);
+      if (parsed === undefined) {
+        notifyError("Debloat: expected a positive number of tokens.");
+        return;
+      }
+      done(String(parsed));
+    };
+    input.onEscape = () => {
+      this.input = null;
+    };
+    this.input = input;
+  }
+
+  private active(): Component {
+    return this.input ?? this.list;
+  }
+
+  render(width: number): string[] {
+    return this.active().render(width);
+  }
+
+  invalidate(): void {
+    this.active().invalidate?.();
+  }
+
+  handleInput(data: string): void {
+    this.active().handleInput?.(data);
+  }
+}
+
+/**
+ * The single post-save summary, shared by the table and the dialog fallback. It
+ * re-resolves through `saveSettings` so the notify names the file actually
+ * written (default-layer resolution, project layer only when `<cwd>/.pi` exists).
+ */
+function notifySettingsSaved(ctx: ExtensionCommandContext, patch: Partial<DebloatSettings>): void {
+  const target = defaultSettingsFile();
+  const saved = resolveSettings(saveSettings(patch));
+  ctx.ui.notify(
+    [
+      `Debloat settings saved to ${target}:`,
+      `  checkpoint: ${modelLabel(saved.checkpointModel)} @ ${saved.checkpointThinkingLevel}`,
+      `  compact:    ${modelLabel(saved.compactModel)} @ ${saved.compactThinkingLevel}`,
+      `  lookback:   ${saved.maxLookbackTokens} tokens`,
+    ].join("\n"),
+    "info",
+  );
+}
+
+/**
+ * TUI path: one SettingsList table. Edits accumulate in `patch`; only the Save
+ * row writes. Escape closes silently with no write and no notify.
+ */
+async function runSettingsTui(ctx: ExtensionCommandContext): Promise<void> {
+  const current = resolveSettings(loadSettings());
+  const available = ctx.modelRegistry
+    .getAvailable()
+    .map((model) => `${model.provider}/${model.id}`);
+  const patch: DebloatSettings = {};
+
+  const result = await ctx.ui.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
+    const items = settingsTableItems(current, available, (message) =>
+      ctx.ui.notify(message, "error"),
+    );
+    const list = new SettingsList(
+      items,
+      Math.min(items.length + 2, 15),
+      getSettingsListTheme(),
+      (id, value) => {
+        if (id === "save") {
+          // Staged edits are flushed once by `notifySettingsSaved` below.
+          done("saved");
+          return;
+        }
+        applySettingChange(patch, id, value);
+      },
+      () => done(undefined),
+    );
+    return {
+      render: (width) => list.render(width),
+      invalidate: () => list.invalidate(),
+      handleInput: (data) => list.handleInput(data),
+    };
+  });
+
+  if (result === undefined) return;
+  notifySettingsSaved(ctx, patch);
+}
+
+/**
+ * Non-TUI fallback (RPC/print): the original five sequential dialogs, kept
+ * because `ctx.ui.custom` is unavailable outside the TUI. Cancelling any dialog
+ * aborts without writes.
+ */
+async function runSettingsDialogs(ctx: ExtensionCommandContext): Promise<void> {
   const current = resolveSettings(loadSettings());
   const available = ctx.modelRegistry
     .getAvailable()
@@ -150,17 +405,16 @@ async function runSettings(ctx: ExtensionCommandContext): Promise<void> {
 
   // Use `saveSettings`'s own default-layer resolution: forcing "project" would
   // create a stray `<cwd>/.pi/debloat.json` and make the global layer unreachable.
-  const target = defaultSettingsFile();
-  const saved = resolveSettings(saveSettings(patch));
-  ctx.ui.notify(
-    [
-      `Debloat settings saved to ${target}:`,
-      `  checkpoint: ${modelLabel(saved.checkpointModel)} @ ${saved.checkpointThinkingLevel}`,
-      `  compact:    ${modelLabel(saved.compactModel)} @ ${saved.compactThinkingLevel}`,
-      `  lookback:   ${saved.maxLookbackTokens} tokens`,
-    ].join("\n"),
-    "info",
-  );
+  notifySettingsSaved(ctx, patch);
+}
+
+/** TUI gets the table; everywhere else keeps the sequential dialogs. */
+async function runSettings(ctx: ExtensionCommandContext): Promise<void> {
+  if (ctx.mode === "tui") {
+    await runSettingsTui(ctx);
+    return;
+  }
+  await runSettingsDialogs(ctx);
 }
 
 function renderTimeline(state: DebloatState, leafId: string | null): string | null {

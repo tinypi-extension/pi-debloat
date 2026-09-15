@@ -24,7 +24,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runCheckpointMake } from "../src/commands/checkpoint-make.js";
@@ -272,6 +273,7 @@ interface UiLog {
   statuses: { key: string; text: string | undefined }[];
   selectTitles: string[];
   inputTitles: string[];
+  customCalls: number;
 }
 
 interface CtxOptions {
@@ -281,13 +283,27 @@ interface CtxOptions {
   confirm?: boolean;
   selectAnswers?: (string | undefined)[];
   inputAnswers?: (string | undefined)[];
+  /** Omitted (undefined) keeps the legacy fallback path, as the Fix J stubs rely on. */
+  mode?: "tui" | "rpc";
 }
 
-function makeCtx(options: CtxOptions): { ctx: ExtensionCommandContext; ui: UiLog } {
-  const ui: UiLog = { notifies: [], statuses: [], selectTitles: [], inputTitles: [] };
+function makeCtx(options: CtxOptions): {
+  ctx: ExtensionCommandContext;
+  ui: UiLog;
+  component: () => Component | undefined;
+} {
+  const ui: UiLog = {
+    notifies: [],
+    statuses: [],
+    selectTitles: [],
+    inputTitles: [],
+    customCalls: 0,
+  };
   const selects = [...(options.selectAnswers ?? [])];
   const inputs = [...(options.inputAnswers ?? [])];
+  let customComponent: Component | undefined;
   const ctx = {
+    mode: options.mode,
     hasUI: true,
     ui: {
       notify(message: string, level?: string) {
@@ -307,6 +323,20 @@ function makeCtx(options: CtxOptions): { ctx: ExtensionCommandContext; ui: UiLog
       async confirm() {
         return options.confirm ?? false;
       },
+      // Mirrors pi's TUI `custom`: run the factory now, resolve when `done` fires.
+      custom<T>(
+        factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
+      ): Promise<T> {
+        ui.customCalls += 1;
+        return new Promise<T>((resolve) => {
+          customComponent = factory(
+            { requestRender() {} } as unknown as TUI,
+            {} as unknown as never,
+            getKeybindings(),
+            resolve,
+          );
+        });
+      },
     },
     modelRegistry: options.registry,
     sessionManager: {
@@ -315,7 +345,11 @@ function makeCtx(options: CtxOptions): { ctx: ExtensionCommandContext; ui: UiLog
       getSessionId: () => "session-1",
     },
   };
-  return { ctx: ctx as unknown as ExtensionCommandContext, ui };
+  return {
+    ctx: ctx as unknown as ExtensionCommandContext,
+    ui,
+    component: () => customComponent,
+  };
 }
 
 function userPromptOf(captured: CapturedStream): string {
@@ -418,6 +452,47 @@ describe("Fix G (criterion 2): /checkpoint-make reports the scanned span", () =>
       { customType: CHECKPOINT_CUSTOM_TYPE, data: { afterEntryId: "e2", label: "turn-one" } },
       { customType: CHECKPOINT_CUSTOM_TYPE, data: { afterEntryId: "e4", label: "turn-two" } },
     ]);
+  });
+});
+
+/* ------------------------- bug: a wrapped judge reply must not fail the command */
+
+describe("bug: /checkpoint-make accepts a {checkpoints: [...]} judge reply", () => {
+  it("places the checkpoints instead of notifying a planning failure", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    // The judge wraps the array in an object; the pre-fix code reported
+    // "checkpoint planning failed — expected a JSON array of checkpoints".
+    const { registry, captured } = makeRegistry({
+      texts: ['{"checkpoints":[{"afterEntryId":"e2","label":"turn-one"}]}'],
+    });
+    const { pi, appended } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e6" });
+
+    await runCheckpointMake(pi, "", ctx);
+
+    // One provider call: the retry budget is not spent on packaging.
+    expect(captured).toHaveLength(1);
+    expect(notifyText(ui)).not.toContain("checkpoint planning failed");
+    expect(notifyText(ui)).toContain("placed 1 checkpoint(s): turn-one");
+    expect(appended).toEqual([
+      { customType: CHECKPOINT_CUSTOM_TYPE, data: { afterEntryId: "e2", label: "turn-one" } },
+    ]);
+  });
+
+  it("still reports a planning failure when the reply carries no usable plan", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    const { registry } = makeRegistry({ texts: ['{"rationale":"nothing to mark"}'] });
+    const { pi, appended } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e6" });
+
+    await runCheckpointMake(pi, "", ctx);
+
+    expect(notifyText(ui)).toContain("checkpoint planning failed");
+    expect(appended).toEqual([]);
   });
 });
 
@@ -630,6 +705,128 @@ describe("Fix J: /debloat settings follows saveSettings' default-layer resolutio
     expect(fs.existsSync(expected)).toBe(true);
     expect(fs.existsSync(path.join(env.home, ".pi", "agent", "debloat.json"))).toBe(false);
     expect(JSON.parse(fs.readFileSync(expected, "utf8"))).toMatchObject({
+      checkpointThinkingLevel: "high",
+      compactThinkingLevel: "medium",
+      maxLookbackTokens: 50_000,
+    });
+  });
+});
+
+/* ---------------------------------------------- /debloat settings table (TUI) */
+
+describe("/debloat settings table (TUI)", () => {
+  beforeEach(() => {
+    // The table builds its theme via getSettingsListTheme(), which reads the
+    // process-global theme; initialize it so component construction doesn't throw.
+    initTheme("dark");
+  });
+
+  it("stages edits and writes them only on Save", async () => {
+    const env = tempEnv();
+    const { registry } = makeRegistry();
+    const { pi } = makePi([]);
+    const { ctx, ui, component } = makeCtx({ branch: [], registry, mode: "tui" });
+
+    const run = runDebloat(pi, "settings", ctx);
+    const view = component();
+    expect(view).toBeDefined();
+    if (!view) throw new Error("expected the TUI component to be created");
+
+    // Row 0 -> row 1 (Checkpoint thinking): cycle low -> medium.
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+    // Down three times to "Max lookback tokens" and open its submenu.
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+    // Submenu preselects 100000; step to 200000 and confirm.
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+    // Back on the token row; down to "Save & exit" and activate.
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+
+    await run;
+
+    expect(ui.selectTitles).toHaveLength(0);
+    expect(ui.customCalls).toBe(1);
+    const file = path.join(env.home, ".pi", "agent", "debloat.json");
+    expect(fs.existsSync(file)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({
+      checkpointThinkingLevel: "medium",
+      maxLookbackTokens: 200_000,
+    });
+    expect(ui.notifies.at(-1)!.msg).toContain(file);
+  });
+
+  it("Escape cancels with no write and no notify", async () => {
+    const env = tempEnv();
+    const { registry } = makeRegistry();
+    const { pi } = makePi([]);
+    const { ctx, ui, component } = makeCtx({ branch: [], registry, mode: "tui" });
+
+    const run = runDebloat(pi, "settings", ctx);
+    component()!.handleInput!("\x1b");
+    await run;
+
+    expect(ui.customCalls).toBe(1);
+    expect(ui.selectTitles).toHaveLength(0);
+    expect(fs.existsSync(path.join(env.home, ".pi", "agent", "debloat.json"))).toBe(false);
+    expect(ui.notifies).toHaveLength(0);
+  });
+
+  it("the custom-token Input rejects invalid input then accepts a typed value", async () => {
+    const env = tempEnv();
+    const { registry } = makeRegistry();
+    const { pi } = makePi([]);
+    const { ctx, ui, component } = makeCtx({ branch: [], registry, mode: "tui" });
+
+    const run = runDebloat(pi, "settings", ctx);
+    const view = component();
+    if (!view) throw new Error("expected the TUI component to be created");
+
+    // Down to the token row, open the submenu, then step to "custom…".
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+    // The prefilled Input starts with the cursor at column 0, so clear it with
+    // forward-delete (ctrl+d) and submit an empty value: rejected, no write.
+    for (let i = 0; i < 6; i += 1) view.handleInput!("\x04");
+    view.handleInput!("\r");
+    expect(ui.notifies.some((n) => n.level === "error")).toBe(true);
+    // Type a valid value and submit.
+    for (const digit of "3000") view.handleInput!(digit);
+    view.handleInput!("\r");
+    // Back on the token row; down to Save and activate.
+    view.handleInput!("\x1b[B");
+    view.handleInput!("\r");
+
+    await run;
+
+    const file = path.join(env.home, ".pi", "agent", "debloat.json");
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ maxLookbackTokens: 3000 });
+  });
+
+  it("falls back to the sequential dialogs outside the TUI (RPC)", async () => {
+    const env = tempEnv();
+    const { registry } = makeRegistry();
+    const { pi } = makePi([]);
+    const answers = ["fake/model-1", "high", "fake/model-1", "medium", "50000"];
+    const { ctx, ui } = makeCtx({ branch: [], registry, mode: "rpc", selectAnswers: answers });
+
+    await runDebloat(pi, "settings", ctx);
+
+    const file = path.join(env.home, ".pi", "agent", "debloat.json");
+    expect(ui.customCalls).toBe(0);
+    expect(ui.selectTitles).toHaveLength(5);
+    expect(fs.existsSync(file)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({
       checkpointThinkingLevel: "high",
       compactThinkingLevel: "medium",
       maxLookbackTokens: 50_000,

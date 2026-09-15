@@ -90,7 +90,8 @@ entries — not synonyms you prefer. An auth refactor is not "login stuff".
 
 ## Output
 
-Return **only JSON**, no prose, no code fences:
+Return **only JSON**, no prose, no code fences. The reply must be a **bare array** at the top
+level — never an object wrapping it (no `{"checkpoints": [...]}`):
 
 ```
 [{"afterEntryId": "01a2b3f0", "label": "oauth-provider-interface-settled"}]

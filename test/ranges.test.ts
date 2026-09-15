@@ -20,8 +20,21 @@ function msg(id: string, role = "user", content: unknown = "hi"): EntryLike {
   return { id, type: "message", message: { role, content } };
 }
 
-function tokenMsg(id: string, totalTokens: number): EntryLike {
-  return { id, type: "message", message: { role: "assistant", content: "x", usage: { totalTokens } } };
+/**
+ * An assistant message costing `tokens` tokens of its own. `totalTokens` mirrors
+ * pi's cumulative request total (larger, and deliberately ignored by
+ * `estimateTokens`) so the fixtures double as a regression guard.
+ */
+function tokenMsg(id: string, tokens: number): EntryLike {
+  return {
+    id,
+    type: "message",
+    message: {
+      role: "assistant",
+      content: "x",
+      usage: { totalTokens: tokens * 10, output: tokens },
+    },
+  };
 }
 
 function checkpoint(id: string, afterEntryId: string, label: string): EntryLike {
@@ -281,14 +294,23 @@ describe("estimateTokens", () => {
     expect(estimateTokens(undefined)).toBe(0);
   });
 
-  it("prefers a finite positive usage.totalTokens", () => {
-    expect(estimateTokens({ role: "assistant", usage: { totalTokens: 1234 } })).toBe(1234);
+  it("prefers the message's own usage.output over usage.totalTokens", () => {
+    expect(
+      estimateTokens({ role: "assistant", content: "x", usage: { totalTokens: 50_000, output: 42 } }),
+    ).toBe(42);
+  });
+
+  it("never charges usage.totalTokens, pi's cumulative request total", () => {
+    // Regression: pi stores the whole-request total (input + cache + output for the
+    // entire context) on every assistant message. Charging it per message let a
+    // single assistant entry exhaust `maxLookbackTokens`.
+    expect(estimateTokens({ role: "assistant", content: "ab", usage: { totalTokens: 105_824 } })).toBe(1);
   });
 
   it("falls back to ceil(chars / 4) for absent or non-positive usage", () => {
-    expect(estimateTokens({ role: "assistant", content: "ab", usage: { totalTokens: 0 } })).toBe(1);
-    expect(estimateTokens({ role: "assistant", content: "ab", usage: { totalTokens: -5 } })).toBe(1);
-    expect(estimateTokens({ role: "assistant", content: "ab", usage: { totalTokens: Number.POSITIVE_INFINITY } })).toBe(1);
+    expect(estimateTokens({ role: "assistant", content: "ab", usage: { totalTokens: 30, output: 0 } })).toBe(1);
+    expect(estimateTokens({ role: "assistant", content: "ab", usage: { output: -5 } })).toBe(1);
+    expect(estimateTokens({ role: "assistant", content: "ab", usage: { output: Number.POSITIVE_INFINITY } })).toBe(1);
   });
 
   it("estimates from JSON-serialized content and handles missing content", () => {
@@ -328,6 +350,42 @@ describe("buildLookbackWindow", () => {
     expect(window.tokens).toBe(120_000);
     expect(window.truncated).toBe(true);
     expect(window.startAfterEntryId).toBe(null);
+  });
+
+  it("does not let one oversized assistant entry empty the window", () => {
+    // Real-session shape: the newest entry is an assistant message whose
+    // cumulative usage.totalTokens alone exceeds the cap. Pre-fix this yielded a
+    // window of 1 message and /checkpoint-make notified "fewer than 2 messages".
+    const entries: EntryLike[] = [
+      msg("m1", "user", "hello"),
+      {
+        id: "m2",
+        type: "message",
+        message: { role: "assistant", content: "hi", usage: { totalTokens: 105_824, output: 3 } },
+      },
+    ];
+    const state = deriveState(entries);
+    const window = buildLookbackWindow(entries, state, 100_000);
+    expect(window.entries.map((e) => e.id)).toEqual(["m1", "m2"]);
+    expect(window.tokens).toBe(estimateTokens(entries[0]?.message) + 3);
+    expect(window.truncated).toBe(false);
+  });
+
+  it("keeps the newest two messages when the budget cannot cover them", () => {
+    const entries = [tokenMsg("m1", 30_000), tokenMsg("m2", 30_000), tokenMsg("m3", 30_000)];
+    const state = deriveState(entries);
+    const window = buildLookbackWindow(entries, state, 1);
+    expect(window.entries.map((e) => e.id)).toEqual(["m2", "m3"]);
+    expect(window.tokens).toBe(60_000);
+    expect(window.truncated).toBe(true);
+  });
+
+  it("returns only the eligible message when a single one follows the anchor", () => {
+    const entries = [msg("m1"), checkpoint("cp1", "m1", "anchor"), msg("m2")];
+    const state = deriveState(entries);
+    const window = buildLookbackWindow(entries, state, 100_000);
+    expect(window.entries.map((e) => e.id)).toEqual(["m2"]);
+    expect(window.truncated).toBe(false);
   });
 
   it("starts the window strictly after the newest active checkpoint", () => {

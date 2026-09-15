@@ -99,10 +99,41 @@ describe("validateCheckpoints", () => {
     expect(validateCheckpoints([])).toEqual([]);
   });
 
-  it("rejects non-arrays", () => {
+  it("accepts a {checkpoints: [...]} wrapper object", () => {
+    expect(
+      validateCheckpoints({
+        checkpoints: [{ afterEntryId: "a", label: "alpha", extra: 1 }],
+      }),
+    ).toEqual([{ afterEntryId: "a", label: "alpha" }]);
+    expect(validateCheckpoints({ checkpoints: [] })).toEqual([]);
+  });
+
+  it("accepts a single bare checkpoint object", () => {
+    expect(validateCheckpoints({ afterEntryId: "a", label: "alpha", extra: 1 })).toEqual([
+      { afterEntryId: "a", label: "alpha" },
+    ]);
+  });
+
+  it("rejects non-arrays that carry no plan", () => {
     expect(typeof validateCheckpoints("nope")).toBe("string");
-    expect(typeof validateCheckpoints({ afterEntryId: "a", label: "b" })).toBe("string");
     expect(typeof validateCheckpoints(null)).toBe("string");
+    expect(typeof validateCheckpoints({ afterEntryId: "a" })).toBe("string");
+    expect(typeof validateCheckpoints({ label: "b" })).toBe("string");
+    expect(typeof validateCheckpoints({})).toBe("string");
+  });
+
+  it("still validates items inside a wrapper object", () => {
+    expect(typeof validateCheckpoints({ checkpoints: "nope" })).toBe("string");
+    expect(typeof validateCheckpoints({ checkpoints: ["x"] })).toBe("string");
+    expect(
+      typeof validateCheckpoints({ checkpoints: [{ afterEntryId: "", label: "a" }] }),
+    ).toBe("string");
+  });
+
+  it("names the accepted shapes in the error message", () => {
+    const error = validateCheckpoints(42);
+    expect(typeof error).toBe("string");
+    if (typeof error === "string") expect(error).toContain("afterEntryId");
   });
 
   it("rejects items that are not objects", () => {
@@ -169,6 +200,17 @@ describe("requestJson", () => {
     expect(requests[1]!.userPrompt).toContain("not json at all");
     expect(requests[1]!.userPrompt.length).toBeGreaterThan(requests[0]!.userPrompt.length);
     expect(result.ok).toBe(true);
+  });
+
+  it("accepts a wrapped checkpoint plan without spending the retry", async () => {
+    let calls = 0;
+    const call: LlmCall = async () => {
+      calls++;
+      return { text: '{"checkpoints":[{"afterEntryId":"a","label":"alpha"}]}' };
+    };
+    const result = await requestJson(call, request, validateCheckpoints);
+    expect(calls).toBe(1);
+    expect(result).toEqual({ ok: true, value: [{ afterEntryId: "a", label: "alpha" }] });
   });
 
   it("retries when validation (not parsing) fails", async () => {

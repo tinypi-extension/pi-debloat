@@ -20,7 +20,7 @@ Rules for every module:
 export interface MessageLike {
   role: string;                       // "user" | "assistant" | "toolResult" | "custom" | ...
   content?: unknown;                  // string or content-block array
-  usage?: { totalTokens?: number; [k: string]: unknown };
+  usage?: { totalTokens?: number; output?: number; [k: string]: unknown };
   timestamp?: number;
   [k: string]: unknown;
 }
@@ -104,6 +104,9 @@ export function sanitizeBoundaries(
 
 export function estimateTokens(message: MessageLike | undefined): number;
 
+/** Minimum messages the judge needs to place a boundary between two of them. */
+export const MIN_WINDOW_MESSAGES: number;
+
 export function buildLookbackWindow(
   entries: readonly EntryLike[], state: DebloatState, maxTokens: number,
 ): { entries: EntryLike[]; startAfterEntryId: string | null; truncated: boolean; tokens: number };
@@ -129,14 +132,18 @@ Semantics:
   `currentLeafId`, or is positioned at/after `currentLeafId`; drop non-kebab-case/empty labels;
   drop candidates not strictly after the newest active checkpoint's `afterEntryId`; drop
   tool-pair splits; dedupe by `afterEntryId`; preserve remaining input order.
-- `estimateTokens`: `usage.totalTokens` when it is a finite positive number, else
-  `Math.ceil(chars / 4)` where `chars = JSON.stringify(message.content).length`.
+- `estimateTokens`: per-message cost, never the whole request — `usage.output` when it is a
+  finite positive number, else `Math.ceil(chars / 4)` where
+  `chars = JSON.stringify(message.content).length`. `usage.totalTokens` is deliberately ignored:
+  pi sets it to the cumulative request total (input + cache + output for the whole context at
+  that moment), so a single assistant message would otherwise consume the entire budget.
 - `buildLookbackWindow`: message entries only (`isMessageEntry`). Walk backwards from the leaf.
   The eligible window starts strictly after the newest **active** checkpoint's `afterEntryId`
   (or at session start when none). Accumulate from newest to oldest, stop once accumulated tokens
-  exceed `maxTokens`; `truncated` = true when messages were dropped by the cap. Return the kept
-  entries in forward (oldest→newest) order, `tokens` = sum of estimates of kept entries,
-  `startAfterEntryId` = the window's exclusive start anchor.
+  exceed `maxTokens` **and** at least `MIN_WINDOW_MESSAGES` (= 2) messages are kept (a single
+  oversized message must never be the whole window); `truncated` = true when messages were
+  dropped by the cap. Return the kept entries in forward (oldest→newest) order, `tokens` = sum of
+  estimates of kept entries, `startAfterEntryId` = the window's exclusive start anchor.
 - `messageIndexMap`: one slot per LLM-visible message, in order; the slot value is the source
   entry id, or `null` for entries that contribute no message. Entries contributing exactly one
   message: `type === "message"`, `type === "compaction"`, `type === "branchSummary"`, and custom
