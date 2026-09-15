@@ -1,0 +1,38 @@
+# Todo: Debloat
+
+- [ ] Task: Implement `src/ranges.ts` (lookback window capping, span computation, cut-point validation, staleness math) + `test/ranges.test.ts`
+  - Acceptance: Pure functions per SPEC D5/D2; covers: no checkpoints, existing checkpoints, all-compacted, mid-tool-pair rejection, native-compaction staleness, 100k token cap.
+  - Verify: `npx vitest run test/ranges.test.ts`
+  - Files: src/ranges.ts, test/ranges.test.ts
+- [ ] Task: Implement `src/state.ts` (derive checkpoints/compactions/tombstones from branch entries) + `test/state.test.ts`
+  - Acceptance: Tombstone ignores earlier checkpoints; overlapping compaction spans rejected; consumed checkpoints excluded; state rebuilds from a plain entry array (pi-independent).
+  - Verify: `npx vitest run test/state.test.ts`
+  - Files: src/state.ts, test/state.test.ts
+- [ ] Task: Implement `src/settings.ts` (load/merge `~/.pi/agent/debloat.json` + `<project>/.pi/debloat.json` overrides, defaults: thinking `low`, lookback 100000) + `test/settings.test.ts`
+  - Acceptance: Missing/corrupt files → defaults, no throw; project keys override global per-key; saves go to the layer being edited; round-trip works; unknown fields preserved.
+  - Verify: `npx vitest run test/settings.test.ts`
+  - Files: src/settings.ts, test/settings.test.ts
+- [ ] Task: Implement `src/context-build.ts` (rebuild LLM message list from entries + state) + `test/context-build.test.ts`
+  - Acceptance: Compacted spans replaced by single synthetic summary messages in correct order; newest span raw; native-compaction messages respected; fail-open returns original messages on internal error.
+  - Verify: `npx vitest run test/context-build.test.ts`
+  - Files: src/context-build.ts, test/context-build.test.ts
+- [ ] Task: Implement `src/llm.ts` (streamSimple one-shot wrapper, transcript formatting, JSON parse + one retry) + `test/llm.test.ts` (parsing only)
+  - Acceptance: Valid/malformed/empty JSON handled per SPEC D3; thinking-level passed via options; usage captured.
+  - Verify: `npx vitest run test/llm.test.ts`
+  - Files: src/llm.ts, test/llm.test.ts
+- [ ] Task: Write `skills/find-checkpoint.md` and `skills/compact.md`
+  - Acceptance: find-checkpoint defines boundary semantics + JSON output schema (`[{afterEntryId, label}]`) and cut-point rules; compact defines per-span title + structured summary format matching compacted-message injection prefix.
+  - Verify: manual read-through against llm.ts prompt assembly
+  - Files: skills/find-checkpoint.md, skills/compact.md
+- [ ] Task: Implement commands: `src/commands/checkpoint-make.ts`, `src/commands/compact-checkpoint.ts`, `src/commands/debloat.ts` (settings dialogs, timeline render, remove-checkpoints confirm)
+  - Acceptance: Behaviors match SPEC command table, including all notification/error paths (no checkpoints, empty window, LLM failure).
+  - Verify: `npx tsc --noEmit`; manual smoke in `pi --extension ./src/index.ts`
+  - Files: src/commands/*
+- [ ] Task: Implement `src/index.ts` extension entry + `package.json`
+  - Acceptance: Registers 2 commands + `/debloat` with argument completions; `context` event wired with fail-open; `session_start` restores state from entries.
+  - Verify: `npx tsc --noEmit`; extension loads in scratch pi session without errors
+  - Files: src/index.ts, package.json
+- [ ] Task: Manual end-to-end verification against SPEC success criteria 1–9 in a scratch session; fix findings
+  - Acceptance: All 9 criteria demonstrably pass; vitest + tsc clean.
+  - Verify: checklist walk in scratch session; `npx vitest run && npx tsc --noEmit`
+  - Files: any fixes needed

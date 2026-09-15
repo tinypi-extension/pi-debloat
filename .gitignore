@@ -1,0 +1,5 @@
+.DS_Store
+node_modules
+.pi
+tasks/spike/out
+.codegraph
