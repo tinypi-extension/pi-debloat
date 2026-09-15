@@ -13,6 +13,7 @@ import {
   requestJson,
   validateCompact,
 } from "../llm.js";
+import { startProgress, type Progress } from "../progress.js";
 import { computeSpans, isMessageEntry, type Span } from "../ranges.js";
 import { loadSettings, resolveSettings } from "../settings.js";
 import {
@@ -131,6 +132,7 @@ export async function runCompactCheckpoint(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   void args;
+  let progress: Progress | undefined;
   try {
     const entries = ctx.sessionManager.getBranch() as unknown as EntryLike[];
     const state = deriveState(entries);
@@ -173,9 +175,16 @@ export async function runCompactCheckpoint(
     const totals: UsageTotals = { calls: 0 };
     let compactedCount = 0;
 
+    progress = startProgress(
+      ctx,
+      `compacting 1/${compactable.length} — "${compactable[0]!.fromLabel}" → "${compactable[0]!.toLabel}"`,
+    );
+
     for (let i = 0; i < compactable.length; i++) {
       const span = compactable[i]!;
-      ctx.ui.setStatus("debloat", `compacting ${i + 1}/${compactable.length} …`);
+      progress.update(
+        `compacting ${i + 1}/${compactable.length} — "${span.fromLabel}" → "${span.toLabel}"`,
+      );
 
       const earlierTitles = [
         ...earlierTitlesFor(state.compactions, positions, span),
@@ -197,7 +206,6 @@ export async function runCompactCheckpoint(
         validateCompact,
       );
       if (!result.ok) {
-        ctx.ui.setStatus("debloat", undefined);
         ctx.ui.notify(
           `Debloat: compacting span "${span.fromLabel}" → "${span.toLabel}" failed — ${result.error}. Earlier spans were kept.`,
           "error",
@@ -235,7 +243,6 @@ export async function runCompactCheckpoint(
       addUsage(totals, result.usage);
     }
 
-    ctx.ui.setStatus("debloat", undefined);
     const rejected = compactable.length - compactedCount;
     if (compactedCount === 0) {
       ctx.ui.notify(
@@ -251,7 +258,8 @@ export async function runCompactCheckpoint(
       "info",
     );
   } catch (error) {
-    ctx.ui.setStatus("debloat", undefined);
     ctx.ui.notify(`Debloat: ${errorText(error)}`, "error");
+  } finally {
+    progress?.stop();
   }
 }

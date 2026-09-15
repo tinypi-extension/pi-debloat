@@ -8,7 +8,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Input, SelectList, SettingsList } from "@earendil-works/pi-tui";
-import type { AutocompleteItem, Component, SettingItem } from "@earendil-works/pi-tui";
+import type {
+  AutocompleteItem,
+  Component,
+  SettingItem,
+  SettingsListTheme,
+} from "@earendil-works/pi-tui";
 import {
   getSelectListTheme,
   getSettingsListTheme,
@@ -126,8 +131,8 @@ export function applySettingChange(patch: DebloatSettings, id: string, value: st
 
 /**
  * The SettingsList rows: label on the left, current value on the right. Rows
- * with `values` cycle in place; rows with `submenu` open a picker. `save` is the
- * only row whose activation writes anything.
+ * with `values` cycle in place; rows with `submenu` open a picker. Every row
+ * writes as soon as it changes — there is no Save row to activate.
  */
 export function settingsTableItems(
   current: ResolvedSettings,
@@ -169,13 +174,6 @@ export function settingsTableItems(
       description: "How much recent context /checkpoint-make scans",
       currentValue: String(current.maxLookbackTokens),
       submenu: (value, done) => new TokenSubmenu(value, done, notifyError),
-    },
-    {
-      id: "save",
-      label: "Save & exit",
-      description: "Write settings and close (Esc cancels without writing)",
-      currentValue: "press Enter to save",
-      values: ["save"],
     },
   ];
 }
@@ -274,28 +272,41 @@ class TokenSubmenu implements Component {
   }
 }
 
-/**
- * The single post-save summary, shared by the table and the dialog fallback. It
- * re-resolves through `saveSettings` so the notify names the file actually
- * written (default-layer resolution, project layer only when `<cwd>/.pi` exists).
- */
-function notifySettingsSaved(ctx: ExtensionCommandContext, patch: Partial<DebloatSettings>): void {
-  const target = defaultSettingsFile();
-  const saved = resolveSettings(saveSettings(patch));
-  ctx.ui.notify(
-    [
-      `Debloat settings saved to ${target}:`,
-      `  checkpoint: ${modelLabel(saved.checkpointModel)} @ ${saved.checkpointThinkingLevel}`,
-      `  compact:    ${modelLabel(saved.compactModel)} @ ${saved.compactThinkingLevel}`,
-      `  lookback:   ${saved.maxLookbackTokens} tokens`,
-    ].join("\n"),
-    "info",
-  );
+/** The one-line-per-setting report both settings paths end with. */
+function settingsSummary(target: string, saved: ResolvedSettings): string {
+  return [
+    `Debloat settings saved to ${target}:`,
+    `  checkpoint: ${modelLabel(saved.checkpointModel)} @ ${saved.checkpointThinkingLevel}`,
+    `  compact:    ${modelLabel(saved.compactModel)} @ ${saved.compactThinkingLevel}`,
+    `  lookback:   ${saved.maxLookbackTokens} tokens`,
+  ].join("\n");
 }
 
 /**
- * TUI path: one SettingsList table. Edits accumulate in `patch`; only the Save
- * row writes. Escape closes silently with no write and no notify.
+ * Dialog fallback only: writes the accumulated patch, then re-resolves through
+ * `saveSettings` so the notify names the file actually written (default-layer
+ * resolution, project layer only when `<cwd>/.pi` exists). The TUI table writes
+ * per edit and reports via `settingsSummary`.
+ */
+function notifySettingsSaved(ctx: ExtensionCommandContext, patch: Partial<DebloatSettings>): void {
+  const target = defaultSettingsFile();
+  ctx.ui.notify(settingsSummary(target, resolveSettings(saveSettings(patch))), "info");
+}
+
+/**
+ * `SettingsList` hardcodes its hint line, which ends in “Esc to cancel”. With
+ * per-edit writes Escape only closes, so reword it through the theme hook. If the
+ * library ever rewords the hint the replace is a no-op rather than a breakage.
+ */
+function settingsTableTheme(): SettingsListTheme {
+  const theme = getSettingsListTheme();
+  return { ...theme, hint: (text) => theme.hint(text.replace("Esc to cancel", "Esc to close")) };
+}
+
+/**
+ * TUI path: one SettingsList table. Every accepted edit is written immediately —
+ * there is no Save row — so Escape just closes and nothing can be lost. The
+ * resolved settings are reported once, and only if at least one edit landed.
  */
 async function runSettingsTui(ctx: ExtensionCommandContext): Promise<void> {
   const current = resolveSettings(loadSettings());
@@ -303,22 +314,24 @@ async function runSettingsTui(ctx: ExtensionCommandContext): Promise<void> {
     .getAvailable()
     .map((model) => `${model.provider}/${model.id}`);
   const patch: DebloatSettings = {};
+  // Written inside the component callback and read after it resolves; the box
+  // keeps TypeScript from narrowing the variable to `null` across the await.
+  const last: { saved: ResolvedSettings | null } = { saved: null };
 
-  const result = await ctx.ui.custom<string | undefined>((_tui, _theme, _keybindings, done) => {
+  await ctx.ui.custom<undefined>((_tui, _theme, _keybindings, done) => {
     const items = settingsTableItems(current, available, (message) =>
       ctx.ui.notify(message, "error"),
     );
     const list = new SettingsList(
       items,
       Math.min(items.length + 2, 15),
-      getSettingsListTheme(),
+      settingsTableTheme(),
       (id, value) => {
-        if (id === "save") {
-          // Staged edits are flushed once by `notifySettingsSaved` below.
-          done("saved");
-          return;
-        }
+        const before = JSON.stringify(patch);
         applySettingChange(patch, id, value);
+        // Unknown ids and unparseable values leave `patch` untouched: no write.
+        if (JSON.stringify(patch) === before) return;
+        last.saved = resolveSettings(saveSettings(patch));
       },
       () => done(undefined),
     );
@@ -329,8 +342,9 @@ async function runSettingsTui(ctx: ExtensionCommandContext): Promise<void> {
     };
   });
 
-  if (result === undefined) return;
-  notifySettingsSaved(ctx, patch);
+  const saved = last.saved;
+  if (saved === null) return;
+  ctx.ui.notify(settingsSummary(defaultSettingsFile(), saved), "info");
 }
 
 /**

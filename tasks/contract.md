@@ -285,6 +285,42 @@ export async function runDebloat(pi: ExtensionAPI, args: string, ctx: ExtensionC
 Each command builds its caller with `createCaller(ctx)` from `src/pi-glue.ts` and hides all
 pi-specific detail there.
 
+## `src/progress.ts` — progress widget (D6)
+
+```ts
+export const PROGRESS_WIDGET_KEY = "debloat-progress";
+export interface Progress { update(message: string): void; stop(): void }
+export function startProgress(ctx: ExtensionCommandContext, message: string): Progress;
+```
+
+The only module that touches `ctx.ui.setWidget`. Exactly one key (`debloat-progress`) is used, so
+the two commands can never stack rows; the widget is placed above the editor (pi's default
+`aboveEditor` placement), which is where the built-in streaming spinner is inert for these
+commands (`streamSimple` runs while the agent is idle). The row is a `Loader` from
+`@earendil-works/pi-tui` colored with `theme.fg("accent", …)` for the spinner and
+`theme.fg("muted", …)` for the message; the displayed text is `<message> (<n>s)` where `n` is whole
+seconds since `startProgress`, refreshed by a 1 s interval (the Loader's own animation interval is
+what triggers the actual renders).
+
+Semantics:
+
+- `startProgress` sets the widget once with the initial message. `update(msg)` replaces the message
+  (the `(Ns)` suffix is maintained internally); calling it before pi invokes the factory is fine.
+- `stop()` is idempotent, clears the elapsed-time interval, stops the Loader, and calls
+  `ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined)`. It is safe when the widget factory was never
+  invoked. `dispose()` (called by pi when the widget is replaced/cleared/reset) also clears the
+  interval, so no timer outlives the command.
+- Entirely best-effort: skipped when `ctx.hasUI !== true`, every `ctx.ui.*` call is inside
+  `try/catch`, `render` returns `[]` after dispose, and it never throws.
+
+Rules for callers:
+
+- Start it immediately before the awaited model call (after the validating early-return guards), so
+  the row covers exactly the model call and never advertises a synchronous phase; stop it in a
+  `finally`, so every exit path (normal end, in-loop failure `return`, and `catch`) clears the row.
+- Never touch the footer status from these commands: `src/index.ts` owns
+  `ctx.ui.setStatus("debloat", …)`; `/compact-checkpoint` no longer writes it at all.
+
 ## `src/pi-glue.ts` — pi glue
 
 ```ts
@@ -366,3 +402,11 @@ landed in `src/` (all verified: `npx vitest run` 137 passed, `npx tsc --noEmit` 
    rejection after the request was dispatched propagates instead of silently re-issuing it through
    `complete()`. The registry fallback is reachable only when `streamSimple` is unavailable or the
    setup threw. Covered by `test/commands.test.ts`.
+9. **`/debloat settings` has no Save row (user request, 2026)**: the TUI table writes every accepted
+   edit to the settings file immediately (`applySettingChange` staged into `patch`, then one
+   `saveSettings(patch)`); unknown ids / unparseable values stage nothing and write nothing. Esc
+   simply closes — nothing is staged, so nothing can be lost — and the single `settingsSummary`
+   notify fires only when at least one edit landed. Because `SettingsList` hardcodes "Esc to
+   cancel" in its hint line, the table passes a theme whose `hint` rewrites that phrase to "Esc to
+   close" (a no-op if the library ever rewords it). The non-TUI dialog fallback still writes once
+   at the end via `notifySettingsSaved`.

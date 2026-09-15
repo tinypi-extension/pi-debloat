@@ -80,13 +80,50 @@ Defaults: thinking levels `low`, `maxLookbackTokens` 100000. A key present in th
 
 Walk backwards from the current leaf accumulating **per-message** token estimates until `maxLookbackTokens` is reached, always keeping at least 2 messages when that many are eligible (a boundary needs one message on each side). Each message is charged its own size — `usage.output` when present, `≈ chars/4` fallback — never `usage.totalTokens`, which pi sets to the cumulative request total and which would let one assistant message consume the whole budget. The window starts at the logical position of the most recent active checkpoint if one exists (its `afterEntryId`), otherwise at session start.
 
+### D6 — Progress indicator above the editor
+
+Both commands make one-shot LLM calls while the agent is idle. pi's built-in
+working spinner only renders on `turn_start` while `session.isStreaming`, and an
+extension command handler runs *before* that (`_tryExecuteExtensionCommand`), so
+`setWorkingMessage` / `setWorkingVisible` / `setWorkingIndicator` never show
+anything here. `/compact-checkpoint` makes one call per span, so silence can last
+minutes.
+
+Therefore progress is surfaced as a **widget above the editor** (above the text
+input), one shared key `debloat-progress`, built from the `Loader` component in
+`@earendil-works/pi-tui` (animated spinner + message + elapsed seconds):
+
+```
+  ⠹ compacting 2/3 — "api-layer" → "tests"  (12s)
+<text input>
+```
+
+| Command | Widget lifecycle |
+|---|---|
+| `/checkpoint-make` | `planning checkpoints — N message(s), ~T token(s)…`, shown for the duration of the model call, then cleared and the existing notify. |
+| `/compact-checkpoint` | `compacting i/N — "from" → "to"` (updated once per span) → cleared, then the summary notify. |
+
+Rules (all mandatory):
+
+- Exactly one widget key, so the two commands can never stack rows; a second
+  `setWidget("debloat-progress", …)` must not be required to clear a previous one.
+- Cleared with `setWidget("debloat-progress", undefined)` on **every** exit path —
+  the normal end, every early `return`, and the `catch` — via `finally`.
+- Never touches pi's footer status: `index.ts` owns `setStatus("debloat", …)` for
+  the checkpoint/span counts, so the commands do not overwrite it.
+- Best-effort: guarded by `ctx.hasUI` and `try/catch`, because a progress row is
+  never worth failing a command. In RPC mode `setWidget` is pi's no-op.
+- The row is first painted on the next render tick, so only phases that overlap
+  an `await` are visible; synchronous work (context reads, `appendEntry` fan-out)
+  must not be advertised as a phase.
+
 ## Commands
 
 | Command | Behavior |
 |---|---|
-| `/checkpoint-make` | Build lookback window (D5). If window has no placeable messages → notify. One-shot call with `find-checkpoint.md`. Validate returned boundaries (valid entry ids, cut-point rules: never split a user→toolResult pair, boundaries strictly after any existing checkpoint positions and before current). Append `debloat-checkpoint` entries. Notify with placed count + labels. |
-| `/compact-checkpoint` | If no active checkpoints → notify "no checkpoints, run /checkpoint-make first". Determine spans: oldest uncompacted checkpoint → latest checkpoint; compact each span sequentially (one LLM call per span, `compact.md` prompt). Append `debloat-compaction` entry per span. Newest span (latest checkpoint → current) is never compacted. Show progress per span. |
-| `/debloat settings` | TUI: one settings table (label → current value) that edits all values in place — checkpoint/compact model pickers, thinking levels, lookback tokens — staged until “Save & exit”; Esc cancels without writing. Non-TUI (RPC/print): the sequential picker dialogs as a fallback. Saves to D4 file. |
+| `/checkpoint-make` | Build lookback window (D5). If window has no placeable messages → notify. One-shot call with `find-checkpoint.md`, progress per D6. Validate returned boundaries (valid entry ids, cut-point rules: never split a user→toolResult pair, boundaries strictly after any existing checkpoint positions and before current). Append `debloat-checkpoint` entries. Notify with placed count + labels. |
+| `/compact-checkpoint` | If no active checkpoints → notify "no checkpoints, run /checkpoint-make first". Determine spans: oldest uncompacted checkpoint → latest checkpoint; compact each span sequentially (one LLM call per span, `compact.md` prompt). Append `debloat-compaction` entry per span. Newest span (latest checkpoint → current) is never compacted. Show progress per span via the D6 widget. |
+| `/debloat settings` | TUI: one settings table (label → current value) that edits all values in place — checkpoint/compact model pickers, thinking levels, lookback tokens — each accepted edit written immediately to the settings file, then one summary notify on close; Esc closes (nothing is staged, so nothing is lost). Non-TUI (RPC/print): the sequential picker dialogs as a fallback. Saves to D4 file. |
 | `/debloat timeline` | Render list: checkpoints in logical order with labels, compaction titles per span, stale/consumed marks, tombstone state. |
 | `/debloat remove-checkpoints` | Confirm dialog → append `debloat-tombstone` → notify count removed. Compaction summaries unaffected. |
 | `/debloat` (no args) | Show usage summary of the subcommands. |
@@ -100,6 +137,7 @@ context-manage/
 │   ├── state.ts          # Derive debloat state from branch entries (checkpoints, compactions, tombstones, staleness)
 │   ├── ranges.ts         # Pure span/range math: window capping, span computation, cut-point validation
 │   ├── llm.ts            # One-shot streamSimple wrapper + JSON parsing/retry
+│   ├── progress.ts       # D6 spinner widget above the editor (Loader + elapsed time)
 │   ├── context-build.ts  # context-event message rebuild (filter compacted, inject summaries)
 │   ├── settings.ts       # Load/save ~/.pi/agent/debloat.json with defaults
 │   └── commands/         # checkpoint-make.ts, compact-checkpoint.ts, debloat.ts (settings/timeline/remove)
@@ -150,7 +188,8 @@ Conventions: kebab-case files, named exports, no default export except the exten
 ## Boundaries
 
 - **Always:** run `npx vitest run` before declaring a task done; validate LLM JSON output; keep raw messages in the session file (never destructive); respect native compaction cut points; confirm before any state-changing command that removes data.
-- **Ask first:** adding runtime dependencies; changing the custom-entry data schema (breaking existing sessions); writing outside `~/.pi/agent/debloat.json` and the project dir.
+- **Ask first:** adding runtime dependencies (the D6 widget reuses the already-used
+  `@earendil-works/pi-tui` `Loader`); changing the custom-entry data schema (breaking existing sessions); writing outside `~/.pi/agent/debloat.json` and the project dir.
 - **Never:** delete or rewrite session entries; trigger LLM calls without the user running a command; inject checkpoint/summary content into the main conversation as visible chat messages; suppress pi's native auto-compaction.
 
 ## Success Criteria
@@ -164,6 +203,12 @@ Conventions: kebab-case files, named exports, no default export except the exten
 7. `/debloat remove-checkpoints` asks for confirmation; after it, checkpoints are gone from state/timeline but summaries still apply in the LLM context.
 8. A native pi compaction between checkpoints marks pre-cut checkpoints consumed; commands keep working.
 9. `npx vitest run` passes; `npx tsc --noEmit` passes.
+10. While `/checkpoint-make` or `/compact-checkpoint` waits on a model call in the
+    TUI, an animated spinner row with the current phase is visible above the text
+    input (`/compact-checkpoint` shows `compacting i/N` per span).
+11. The progress row is gone when the command ends — on success, on a mid-loop
+    failure, and on an exception — i.e. `setWidget("debloat-progress", undefined)`
+    is called exactly once per run and the footer status is left to `index.ts`.
 
 ## Open Questions
 

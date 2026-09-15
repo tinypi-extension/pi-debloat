@@ -24,7 +24,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { initTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -32,6 +32,7 @@ import { runCheckpointMake } from "../src/commands/checkpoint-make.js";
 import { runCompactCheckpoint } from "../src/commands/compact-checkpoint.js";
 import { runDebloat } from "../src/commands/debloat.js";
 import { createCaller } from "../src/pi-glue.js";
+import { startProgress } from "../src/progress.js";
 import * as ranges from "../src/ranges.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
@@ -95,6 +96,23 @@ function compactableBranch(): EntryLike[] {
     checkpoint("c2", "e4", "two"),
     msg("e5", "user", "u3"),
     msg("e6", "assistant", "a3"),
+  ];
+}
+
+/** Three checkpoints => two compactable spans (e2, e4] and (e4, e6]; leaf e8. */
+function twoSpanBranch(): EntryLike[] {
+  return [
+    msg("e1", "user", "u1"),
+    msg("e2", "assistant", "a1"),
+    checkpoint("c1", "e2", "one"),
+    msg("e3", "user", "u2"),
+    msg("e4", "assistant", "a2"),
+    checkpoint("c2", "e4", "two"),
+    msg("e5", "user", "u3"),
+    msg("e6", "assistant", "a3"),
+    checkpoint("c3", "e6", "three"),
+    msg("e7", "user", "u4"),
+    msg("e8", "assistant", "a4"),
   ];
 }
 
@@ -209,6 +227,8 @@ interface RegistryOptions {
   resultRejects?: boolean;
   completeText?: string;
   completeThrows?: boolean;
+  /** Invoked synchronously inside `streamSimple`, before `result()`, so a test can snapshot UI mid-call. */
+  onStream?: () => void;
 }
 
 /**
@@ -236,6 +256,7 @@ function makeRegistry(options: RegistryOptions = {}): {
     ) {
       if (options.streamSimpleThrows) throw new Error("streamSimple setup exploded");
       captured.push({ model: streamModel, context, options: streamOptions });
+      options.onStream?.();
       const text = texts[Math.min(index, texts.length - 1)] ?? "[]";
       index += 1;
       return {
@@ -268,12 +289,19 @@ function makeRegistry(options: RegistryOptions = {}): {
   return { registry, captured, completeCalls, model };
 }
 
+interface WidgetLog {
+  key: string;
+  content: unknown;
+  component?: Component & { dispose?(): void };
+}
+
 interface UiLog {
   notifies: { msg: string; level?: string }[];
   statuses: { key: string; text: string | undefined }[];
   selectTitles: string[];
   inputTitles: string[];
   customCalls: number;
+  widgets: WidgetLog[];
 }
 
 interface CtxOptions {
@@ -285,12 +313,15 @@ interface CtxOptions {
   inputAnswers?: (string | undefined)[];
   /** Omitted (undefined) keeps the legacy fallback path, as the Fix J stubs rely on. */
   mode?: "tui" | "rpc";
+  /** Defaults to true; `false` exercises the no-UI degradation path. */
+  hasUI?: boolean;
 }
 
 function makeCtx(options: CtxOptions): {
   ctx: ExtensionCommandContext;
   ui: UiLog;
   component: () => Component | undefined;
+  widget: () => Component | undefined;
 } {
   const ui: UiLog = {
     notifies: [],
@@ -298,19 +329,42 @@ function makeCtx(options: CtxOptions): {
     selectTitles: [],
     inputTitles: [],
     customCalls: 0,
+    widgets: [],
   };
   const selects = [...(options.selectAnswers ?? [])];
   const inputs = [...(options.inputAnswers ?? [])];
   let customComponent: Component | undefined;
+  let widgetComponent: Component | undefined;
   const ctx = {
     mode: options.mode,
-    hasUI: true,
+    hasUI: options.hasUI ?? true,
     ui: {
       notify(message: string, level?: string) {
         ui.notifies.push(level === undefined ? { msg: message } : { msg: message, level });
       },
       setStatus(key: string, text: string | undefined) {
         ui.statuses.push({ key, text });
+      },
+      setWidget(key: string, content: unknown) {
+        const entry: WidgetLog = { key, content };
+        if (typeof content === "function") {
+          const factory = content as (tui: TUI, theme: Theme) => Component & { dispose?(): void };
+          const component = factory(
+            { requestRender() {} } as unknown as TUI,
+            { fg: (_color: string, s: string) => s } as unknown as Theme,
+          );
+          entry.component = component;
+          widgetComponent = component;
+        } else if (content === undefined) {
+          for (let i = ui.widgets.length - 1; i >= 0; i -= 1) {
+            const prior = ui.widgets[i]!;
+            if (prior.key === key && prior.component) {
+              prior.component.dispose?.();
+              break;
+            }
+          }
+        }
+        ui.widgets.push(entry);
       },
       async select(title: string) {
         ui.selectTitles.push(title);
@@ -349,6 +403,7 @@ function makeCtx(options: CtxOptions): {
     ctx: ctx as unknown as ExtensionCommandContext,
     ui,
     component: () => customComponent,
+    widget: () => widgetComponent,
   };
 }
 
@@ -452,6 +507,162 @@ describe("Fix G (criterion 2): /checkpoint-make reports the scanned span", () =>
       { customType: CHECKPOINT_CUSTOM_TYPE, data: { afterEntryId: "e2", label: "turn-one" } },
       { customType: CHECKPOINT_CUSTOM_TYPE, data: { afterEntryId: "e4", label: "turn-two" } },
     ]);
+  });
+});
+
+/* ------------------------------- D6: progress widget above the editor */
+
+describe("D6: progress widget above the editor", () => {
+  const clearsOf = (ui: UiLog, key: string) =>
+    ui.widgets.filter((widget) => widget.key === key && widget.content === undefined);
+
+  it("/checkpoint-make shows planning progress during the call and clears it exactly once", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    const snapshots: string[] = [];
+    const holder: { widget?: () => Component | undefined } = {};
+    const { registry, captured } = makeRegistry({
+      texts: ['[{"afterEntryId":"e2","label":"turn-one"}]'],
+      onStream: () => {
+        const widget = holder.widget?.();
+        if (widget) snapshots.push(widget.render(80).join(" "));
+      },
+    });
+    const { pi } = makePi(branch);
+    const { ctx, ui, widget } = makeCtx({ branch, registry, leafId: "e6" });
+    holder.widget = widget;
+
+    await runCheckpointMake(pi, "", ctx);
+
+    expect(captured).toHaveLength(1);
+    // The widget is set before the model call and its in-flight render carries
+    // the phase plus the window message/token counts.
+    expect(ui.widgets[0]!.key).toBe("debloat-progress");
+    expect(typeof ui.widgets[0]!.content).toBe("function");
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toContain("planning checkpoints");
+    expect(snapshots[0]).toContain("6 message(s)");
+    expect(snapshots[0]).toContain("~6 token(s)");
+    expect(clearsOf(ui, "debloat-progress")).toHaveLength(1);
+  });
+
+  it("/compact-checkpoint shows compacting i/N per span and clears once with no debloat setStatus", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { compactModel: MODEL_REF });
+    const branch = twoSpanBranch();
+    const snapshots: string[] = [];
+    const holder: { widget?: () => Component | undefined } = {};
+    const { registry, captured } = makeRegistry({
+      texts: [
+        '{"title":"span-one","summary":"compacted one"}',
+        '{"title":"span-two","summary":"compacted two"}',
+      ],
+      onStream: () => {
+        const widget = holder.widget?.();
+        if (widget) snapshots.push(widget.render(80).join(" "));
+      },
+    });
+    const { pi } = makePi(branch);
+    const { ctx, ui, widget } = makeCtx({ branch, registry, leafId: "e8" });
+    holder.widget = widget;
+
+    await runCompactCheckpoint(pi, "", ctx);
+
+    expect(captured).toHaveLength(2);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]).toContain("compacting 1/2");
+    expect(snapshots[1]).toContain("compacting 2/2");
+    // The footer status is owned by index.ts, so this command must not write it.
+    expect(ui.statuses.filter((status) => status.key === "debloat")).toHaveLength(0);
+    expect(clearsOf(ui, "debloat-progress")).toHaveLength(1);
+  });
+
+  it("/compact-checkpoint clears the widget and notifies when a span call throws", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { compactModel: MODEL_REF });
+    const branch = twoSpanBranch();
+    const { registry } = makeRegistry({ texts: ['{}'], resultRejects: true });
+    const { pi } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e8" });
+
+    await runCompactCheckpoint(pi, "", ctx);
+
+    expect(ui.notifies.some((notify) => notify.level === "error")).toBe(true);
+    expect(clearsOf(ui, "debloat-progress")).toHaveLength(1);
+  });
+
+  it("/compact-checkpoint clears the widget when a span reply is unusable", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { compactModel: MODEL_REF });
+    const branch = twoSpanBranch();
+    const { registry } = makeRegistry({ texts: ["not json", "still not json"] });
+    const { pi } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e8" });
+
+    await runCompactCheckpoint(pi, "", ctx);
+
+    expect(ui.notifies.some((notify) => notify.level === "error")).toBe(true);
+    expect(clearsOf(ui, "debloat-progress")).toHaveLength(1);
+  });
+
+  it("/checkpoint-make with hasUI:false makes no widget call and does not throw", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    const { registry } = makeRegistry({
+      texts: ['[{"afterEntryId":"e2","label":"turn-one"}]'],
+    });
+    const { pi, appended } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e6", hasUI: false });
+
+    await expect(runCheckpointMake(pi, "", ctx)).resolves.toBeUndefined();
+
+    expect(ui.widgets).toHaveLength(0);
+    expect(appended).toHaveLength(1);
+  });
+
+  it("/checkpoint-make degrades to a no-op when ui.setWidget is absent", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    const { registry } = makeRegistry({
+      texts: ['[{"afterEntryId":"e2","label":"turn-one"}]'],
+    });
+    const { pi, appended } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e6" });
+    delete (ctx.ui as { setWidget?: unknown }).setWidget;
+
+    await expect(runCheckpointMake(pi, "", ctx)).resolves.toBeUndefined();
+
+    expect(ui.widgets).toHaveLength(0);
+    expect(appended).toHaveLength(1);
+    expect(notifyText(ui)).toContain("placed 1 checkpoint(s): turn-one");
+  });
+
+  it("/checkpoint-make survives a throwing setWidget and its handle cannot throw", async () => {
+    const env = tempEnv();
+    writeSettings(env, "global", { checkpointModel: MODEL_REF });
+    const branch = conversation();
+    const { registry } = makeRegistry({
+      texts: ['[{"afterEntryId":"e2","label":"turn-one"}]'],
+    });
+    const { pi, appended } = makePi(branch);
+    const { ctx, ui } = makeCtx({ branch, registry, leafId: "e6" });
+    (ctx.ui as { setWidget: (key: string, content: unknown) => void }).setWidget = () => {
+      throw new Error("boom");
+    };
+
+    // Running to completion exercises the `finally { progress?.stop(); }` path.
+    await expect(runCheckpointMake(pi, "", ctx)).resolves.toBeUndefined();
+
+    expect(appended).toHaveLength(1);
+    expect(notifyText(ui)).toContain("placed 1 checkpoint(s): turn-one");
+
+    // The degraded handle stays non-throwing even though every ui call failed.
+    const handle = startProgress(ctx, "x");
+    expect(() => handle.update("y")).not.toThrow();
+    expect(() => handle.stop()).not.toThrow();
   });
 });
 
@@ -721,20 +932,32 @@ describe("/debloat settings table (TUI)", () => {
     initTheme("dark");
   });
 
-  it("stages edits and writes them only on Save", async () => {
+  it("writes every accepted edit immediately; Escape closes and reports the result once", async () => {
     const env = tempEnv();
     const { registry } = makeRegistry();
     const { pi } = makePi([]);
     const { ctx, ui, component } = makeCtx({ branch: [], registry, mode: "tui" });
+    const file = path.join(env.home, ".pi", "agent", "debloat.json");
 
     const run = runDebloat(pi, "settings", ctx);
     const view = component();
     expect(view).toBeDefined();
     if (!view) throw new Error("expected the TUI component to be created");
 
+    // No Save row, and no hint promising that Escape cancels an unsaved edit.
+    const rendered = view.render(80).join("\n");
+    expect(rendered).not.toContain("Save");
+    expect(rendered).not.toContain("Esc to cancel");
+
     // Row 0 -> row 1 (Checkpoint thinking): cycle low -> medium.
     view.handleInput!("\x1b[B");
     view.handleInput!("\r");
+    // The edit is already on disk, before the table closes.
+    expect(ui.notifies).toHaveLength(0);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({
+      checkpointThinkingLevel: "medium",
+    });
+
     // Down three times to "Max lookback tokens" and open its submenu.
     view.handleInput!("\x1b[B");
     view.handleInput!("\x1b[B");
@@ -743,16 +966,18 @@ describe("/debloat settings table (TUI)", () => {
     // Submenu preselects 100000; step to 200000 and confirm.
     view.handleInput!("\x1b[B");
     view.handleInput!("\r");
-    // Back on the token row; down to "Save & exit" and activate.
-    view.handleInput!("\x1b[B");
-    view.handleInput!("\r");
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({
+      checkpointThinkingLevel: "medium",
+      maxLookbackTokens: 200_000,
+    });
+
+    // Escape closes the table; the edits are already persisted.
+    view.handleInput!("\x1b");
 
     await run;
 
     expect(ui.selectTitles).toHaveLength(0);
     expect(ui.customCalls).toBe(1);
-    const file = path.join(env.home, ".pi", "agent", "debloat.json");
-    expect(fs.existsSync(file)).toBe(true);
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({
       checkpointThinkingLevel: "medium",
       maxLookbackTokens: 200_000,
@@ -760,7 +985,7 @@ describe("/debloat settings table (TUI)", () => {
     expect(ui.notifies.at(-1)!.msg).toContain(file);
   });
 
-  it("Escape cancels with no write and no notify", async () => {
+  it("Escape with no edits writes nothing and notifies nothing", async () => {
     const env = tempEnv();
     const { registry } = makeRegistry();
     const { pi } = makePi([]);
@@ -781,6 +1006,7 @@ describe("/debloat settings table (TUI)", () => {
     const { registry } = makeRegistry();
     const { pi } = makePi([]);
     const { ctx, ui, component } = makeCtx({ branch: [], registry, mode: "tui" });
+    const file = path.join(env.home, ".pi", "agent", "debloat.json");
 
     const run = runDebloat(pi, "settings", ctx);
     const view = component();
@@ -800,16 +1026,16 @@ describe("/debloat settings table (TUI)", () => {
     for (let i = 0; i < 6; i += 1) view.handleInput!("\x04");
     view.handleInput!("\r");
     expect(ui.notifies.some((n) => n.level === "error")).toBe(true);
-    // Type a valid value and submit.
+    expect(fs.existsSync(file)).toBe(false);
+    // Type a valid value and submit: the write happens on submit.
     for (const digit of "3000") view.handleInput!(digit);
     view.handleInput!("\r");
-    // Back on the token row; down to Save and activate.
-    view.handleInput!("\x1b[B");
-    view.handleInput!("\r");
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ maxLookbackTokens: 3000 });
+    // Escape closes the table.
+    view.handleInput!("\x1b");
 
     await run;
 
-    const file = path.join(env.home, ".pi", "agent", "debloat.json");
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ maxLookbackTokens: 3000 });
   });
 

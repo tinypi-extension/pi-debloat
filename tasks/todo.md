@@ -1,6 +1,6 @@
 # Todo: Debloat
 
-Status: **8/9 done.** Suite `npx vitest run` → 159 passed (8 files); `npx tsc --noEmit` clean;
+Status: **9/10 done.** Suite `npx vitest run` → 179 passed (8 files); `npx tsc --noEmit` clean;
 extension loads through pi's own loader with zero errors. The remaining item is the live-session
 walkthrough (needs model auth) — see the last task.
 
@@ -49,3 +49,8 @@ walkthrough (needs model auth) — see the last task.
   - Verify: checklist walk in scratch session; `npx vitest run && npx tsc --noEmit`
   - Files: any fixes needed
   - Status: **NOT DONE — blocked on a live pi session with model auth.** Automated halves: 159 tests, tsc clean, and criteria 1–9 were re-scored against the current code by an independent verifier (none UNMET; 4 are static/unit-only for their user-visible half) with a real-`SessionManager` integration test proving criteria 5 and 8. Still to confirm by hand: real label/summary quality (criterion 1), the real retry-trim re-alignment path, a real post-compaction LLM request (criterion 5), and TUI rendering of the dialogs/timeline/notifies (criteria 2, 6, 7). Suggested walkthrough: `/debloat settings` → `/checkpoint-make` → `/compact-checkpoint` → `/debloat timeline` → `/debloat remove-checkpoints`.
+- [x] Task: Add the D6 progress widget above the editor for `/checkpoint-make` and `/compact-checkpoint` (`src/progress.ts` + command wiring)
+  - Acceptance: A single `debloat-progress` widget (animated `Loader` + elapsed seconds) is visible above the text input while a model call is in flight; `/checkpoint-make` shows `planning checkpoints — N message(s), ~T token(s)…`, `/compact-checkpoint` shows `compacting i/N — "from" → "to"` per span, and only phases that overlap an `await` are advertised (the row is first painted on the next render tick); the widget is cleared with `undefined` exactly once on every exit path (normal end, in-loop failure return, exception); `hasUI:false` makes no widget call and never throws; the commands no longer write `setStatus("debloat", …)` (owned by `index.ts`).
+  - Verify: `npx vitest run`; `npx tsc --noEmit`
+  - Files: src/progress.ts, src/commands/checkpoint-make.ts, src/commands/compact-checkpoint.ts, test/commands.test.ts, test/progress.test.ts, tasks/contract.md, SPEC.md
+  - Done: implemented; `startProgress` is best-effort (hasUI-guarded, try/catch, never throws) and `stop()` clears the 1 s elapsed timer plus the Loader's animation timer in both `stop()` and `dispose()`. Both commands start the row immediately before the awaited model call and stop it in a `finally`, so it covers exactly the model call; `/checkpoint-make`'s earlier `reading context…` / `placing …` phases were removed after an independent review measured them unpaintable (pi defers the first render to the next tick). Row renders without a doubled blank line (pi adds its own spacer above widget rows). 5 command-level tests (in-flight render snapshots via a provider-stub `onStream` hook, exactly-once clear, no `debloat` setStatus, thrown/unusable span replies, `hasUI:false`) plus 9 direct `src/progress.ts` unit tests (suffix, lazy-factory update, double `stop()`, dispose-then-stop, timer baseline, no-op degradations). Suite 190 passed, tsc clean.

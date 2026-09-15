@@ -14,6 +14,7 @@ import {
   truncateBody,
   validateCheckpoints,
 } from "../llm.js";
+import { startProgress, type Progress } from "../progress.js";
 import { buildLookbackWindow, MIN_WINDOW_MESSAGES, sanitizeBoundaries } from "../ranges.js";
 import { loadSettings, resolveSettings } from "../settings.js";
 import {
@@ -60,6 +61,7 @@ export async function runCheckpointMake(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   void args;
+  let progress: Progress | undefined;
   try {
     const settings = resolveSettings(loadSettings());
     if (!settings.checkpointModel) {
@@ -119,6 +121,10 @@ export async function runCheckpointMake(
       formatTranscript(window.entries),
     ].join("\n");
 
+    progress = startProgress(
+      ctx,
+      `planning checkpoints — ${window.entries.length} message(s), ~${window.tokens} token(s)…`,
+    );
     const caller = createCaller(ctx, settings.checkpointModel, settings.checkpointThinkingLevel);
     const result = await requestJson(
       caller.call,
@@ -154,5 +160,7 @@ export async function runCheckpointMake(
     );
   } catch (error) {
     ctx.ui.notify(`Debloat: ${errorText(error)}`, "error");
+  } finally {
+    progress?.stop();
   }
 }
