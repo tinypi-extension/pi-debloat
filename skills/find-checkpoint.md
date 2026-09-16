@@ -33,149 +33,101 @@ anchor: checkpoint "session-store-migrated" at node 01a2b3c0
 - Everything before the anchor is already handled. Do not propose checkpoints there.
 
 ---
+## Checkpoint Placement Principles
+### Goal
+Place checkpoints to divide context into semantically coherent ranges. Each range should represent one meaningful unit that can be compacted independently.
 
-## Checkpoint Placement Rules
+### Core Principle
+A checkpoint should be placed where the semantic focus changes, not merely where text length grows.
 
-Place a checkpoint at a **semantic boundary** where the preceding context can be summarized independently.
+#### Placement Rules
+##### Split at Semantic Transitions
+Place a checkpoint when any of the following changes:
+- Topic
+- Task
+- Intent
+- Speaker role
+- Time frame
+- Data source
+- Reference target
+- Problem step
 
-### 1. Prefer task/phase boundaries
+##### Preserve Complete Thoughts
+Do not split inside:
+- A sentence
+- A definition
+- A code block
+- A table
+- A list item
+- A dialogue turn
+- A logical argument
+- A cause-effect relation
 
-Place a checkpoint when the agent finishes or transitions between:
+##### Keep Entities Intact
+Keep related mentions together:
+- Same person
+- Same object
+- Same concept
+- Same function
+- Same variable
+- Same document section
+Place checkpoints only after the entity or concept is no longer central.
 
-* Understanding / investigation
-* Planning
-* Implementation
-* Testing
-* Debugging
-* Review
-* Finalization
+##### Prefer Natural Structural Boundaries
+Use existing structure as hints:
+- Headings
+- Paragraph breaks
+- Section changes
+- Message boundaries
+- Code/comment boundaries
+- Question-answer boundaries
+Structural boundaries are hints, not absolute rules.
 
-### 2. Place after completed reasoning units
+##### Avoid Over-Splitting
+Do not create a new segment for small variations such as:
+- Synonyms
+- Minor elaboration
+- Rephrasing
+- Examples supporting the same point
+- Continued explanation of the same concept
 
-Place a checkpoint when a substantial reasoning thread is complete, such as:
+#### Segment Size Guidance
+##### Minimum
+A segment should contain enough meaning to be understood or compacted independently.
+##### Maximum
+If a segment becomes too long, split only at the strongest semantic boundary inside it.
 
-* A question has been answered
-* A hypothesis has been confirmed or rejected
-* A bug root cause has been identified
-* A design decision has been made
-* A technical approach has been selected
+Prefer:
+> Fewer meaningful segments
+> over many trivial fragments.
 
-### 3. Place after tool-heavy exploration
+##### Priority Order
+When deciding where to place checkpoints, use this priority:
+- Do not break semantic completeness
+- Do not break entities or references
+- Respect structural boundaries
+- Keep segments compactable
+- Control segment length
 
-When many tool calls produce intermediate information, place a checkpoint after the exploration has produced a stable conclusion.
+##### Checkpoint Decision Checklist
 
-The compacted result should preserve:
+Before placing a checkpoint, ask:
+- Does the topic change here?
+- Can the previous range stand alone?
+- Are all references inside the range resolvable?
+- Is this a natural discourse boundary?
+- Would splitting here lose important context?
+If most answers are yes, place a checkpoint.
 
-* Important findings
-* Relevant file paths
-* Important code changes
-* Decisions
-* Constraints
-* Unresolved issues
-
-### 4. Do not checkpoint in the middle of a dependency chain
-
-Do NOT place a checkpoint when the following context still depends heavily on the immediately preceding reasoning.
-
-Examples:
-
-* Before finishing an analysis
-* Between a hypothesis and its verification
-* Between a tool call and interpretation of its result
-* In the middle of implementing one cohesive change
-
-### 5. Checkpoint after major decisions
-
-A checkpoint is useful immediately after decisions that future context must remember.
-
-Examples:
-
-* "We will use approach B."
-* "The crash is caused by calling MainActor from this actor."
-* "This API is unavailable on iOS 17."
-* "Do not modify this shared component."
-
-### 6. Keep related implementation work together
-
-For a single feature or bug fix, avoid splitting:
-
-* Requirement understanding
-* Relevant code inspection
-* Implementation
-* Immediate verification
-
-unless the context becomes large enough that splitting is necessary.
-
-### 7. Avoid excessive checkpoints
-
-Do not checkpoint:
-
-* Every message
-* Every tool call
-* Every file
-* Small observations
-* Temporary thoughts
-* Repeated information
-
-A checkpoint should represent a **meaningful boundary**, not a timestamp.
-
-### 8. Checkpoint before a major context shift
-
-Place a checkpoint when the agent moves to a substantially different subject or task.
-
-Examples:
-
-* Feature A → Feature B
-* Bug investigation → unrelated refactor
-* Implementation → documentation
-* Coding → architectural discussion
-
-### 9. Preserve unresolved work
-
-Before checkpointing, ensure the preceding section contains enough information to recover its state.
-
-Important unresolved items should be recorded:
-
-* Open questions
-* Failed approaches
-* Remaining tasks
-* Assumptions
-* Dependencies
-
-### 10. Optimize for independent compaction
-
-Ask:
-
-> "Could this range be compacted into a self-contained summary without needing the previous range?"
-
-If **yes**, a checkpoint is appropriate.
-
-If **no**, continue the current range.
-
-### 11. Prefer fewer, stronger boundaries
-
-When multiple possible checkpoint locations exist, prefer the boundary that produces the largest coherent unit.
-
-### 12. Never checkpoint solely because of token count
-
-Token count may be a **secondary trigger**, but semantic coherence takes priority.
-
-When approaching the context-size limit, choose the nearest safe semantic boundary rather than splitting arbitrarily.
-
-
-## Anti-patterns
-
-| Anti-pattern | Why it fails |
-| --- | --- |
-| Checkpointing every phase so nothing is missed | Dense labels are indistinguishable from no labels. The timeline becomes noise. |
-| Checkpointing a phase that is still in flux | The scene may not hold; the label points at a moment that was never a footing. |
-| Naming by position (`step-2`, `phase-b`) | Carries no information; the human still has to open the node to know what it is. |
-| Naming with a word the session never used | The human does not recognize the state from its label. |
-| Writing a rationale you cannot point to in the entries | It reads as fact and the human cannot check it. |
-| Reaching before the anchor | Already handled. Out of scope. |
-| Inventing or abbreviating a node id | Discarded silently. Cite ids exactly. |
-
----
+## Anti-Patterns
+Avoid placing checkpoints:
+- In the middle of a sentence
+- Between a term and its definition
+- Between a question and its answer
+- Inside a code block
+- Between tightly connected instructions
+- Between a claim and its justification
+- Between a reference and what it refers to
 
 ## Output
 
