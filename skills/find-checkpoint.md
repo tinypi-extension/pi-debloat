@@ -34,44 +34,133 @@ anchor: checkpoint "session-store-migrated" at node 01a2b3c0
 
 ---
 
-## Your decision — where should checkpoints go?
+## Checkpoint Placement Rules
 
-A checkpoint is a **name for a state worth returning to**. The human later sees these in a
-timeline and may rewind to one. Your job is to retrofit the boundaries that the human never
-marked while they were busy working.
+Place a checkpoint at a **semantic boundary** where the preceding context can be summarized independently.
 
-**Place a checkpoint where the session reached a stable footing:**
+### 1. Prefer task/phase boundaries
 
-- a sub-task finished and its result is decided, not still in flux
-- a decision was made that constrains everything after it (an approach chosen, a schema fixed,
-  a library picked, a bug root-caused)
-- validation passed, or a failure was confirmed and understood
-- the session pivoted — the old approach was abandoned and a different one began
-- immediately **before** a long stretch of noise (searching, log-reading, retries, tool
-  churn). The node before the noise is the state you would want to come back to.
+Place a checkpoint when the agent finishes or transitions between:
 
-**Do not place a checkpoint:**
+* Understanding / investigation
+* Planning
+* Implementation
+* Testing
+* Debugging
+* Review
+* Finalization
 
-- on noise itself — a search, a failed attempt, a log dump, a repeated tool result
-- once per turn, or once per user message, just to have produced something
-- at the head merely because it is the head
-- more than once for the same phase
-- before the anchor
+### 2. Place after completed reasoning units
 
-**How many.** Between zero and eight. **Zero is a correct and common answer.** A window that
-is short, clean, and still in the middle of one coherent action needs nothing. A judge that
-always finds something to mark is a broken judge — you will be marking noise, and the human
-will learn to ignore your labels.
+Place a checkpoint when a substantial reasoning thread is complete, such as:
 
-**Names.** Kebab-case, short, specific. They must read as a phrase a human would say out loud
-when returning to this state.
+* A question has been answered
+* A hypothesis has been confirmed or rejected
+* A bug root cause has been identified
+* A design decision has been made
+* A technical approach has been selected
 
-- Good: `session-store-migrated`, `oauth-provider-interface-settled`, `n-plus-one-root-caused`,
-  `parser-rewrite-abandoned`
-- Bad: `checkpoint-1`, `step-3`, `progress`, `work-done`, `misc`, `fix`
+### 3. Place after tool-heavy exploration
 
-Use the session's own vocabulary — the words from the original request and the surrounding
-entries — not synonyms you prefer. An auth refactor is not "login stuff".
+When many tool calls produce intermediate information, place a checkpoint after the exploration has produced a stable conclusion.
+
+The compacted result should preserve:
+
+* Important findings
+* Relevant file paths
+* Important code changes
+* Decisions
+* Constraints
+* Unresolved issues
+
+### 4. Do not checkpoint in the middle of a dependency chain
+
+Do NOT place a checkpoint when the following context still depends heavily on the immediately preceding reasoning.
+
+Examples:
+
+* Before finishing an analysis
+* Between a hypothesis and its verification
+* Between a tool call and interpretation of its result
+* In the middle of implementing one cohesive change
+
+### 5. Checkpoint after major decisions
+
+A checkpoint is useful immediately after decisions that future context must remember.
+
+Examples:
+
+* "We will use approach B."
+* "The crash is caused by calling MainActor from this actor."
+* "This API is unavailable on iOS 17."
+* "Do not modify this shared component."
+
+### 6. Keep related implementation work together
+
+For a single feature or bug fix, avoid splitting:
+
+* Requirement understanding
+* Relevant code inspection
+* Implementation
+* Immediate verification
+
+unless the context becomes large enough that splitting is necessary.
+
+### 7. Avoid excessive checkpoints
+
+Do not checkpoint:
+
+* Every message
+* Every tool call
+* Every file
+* Small observations
+* Temporary thoughts
+* Repeated information
+
+A checkpoint should represent a **meaningful boundary**, not a timestamp.
+
+### 8. Checkpoint before a major context shift
+
+Place a checkpoint when the agent moves to a substantially different subject or task.
+
+Examples:
+
+* Feature A → Feature B
+* Bug investigation → unrelated refactor
+* Implementation → documentation
+* Coding → architectural discussion
+
+### 9. Preserve unresolved work
+
+Before checkpointing, ensure the preceding section contains enough information to recover its state.
+
+Important unresolved items should be recorded:
+
+* Open questions
+* Failed approaches
+* Remaining tasks
+* Assumptions
+* Dependencies
+
+### 10. Optimize for independent compaction
+
+Ask:
+
+> "Could this range be compacted into a self-contained summary without needing the previous range?"
+
+If **yes**, a checkpoint is appropriate.
+
+If **no**, continue the current range.
+
+### 11. Prefer fewer, stronger boundaries
+
+When multiple possible checkpoint locations exist, prefer the boundary that produces the largest coherent unit.
+
+### 12. Never checkpoint solely because of token count
+
+Token count may be a **secondary trigger**, but semantic coherence takes priority.
+
+When approaching the context-size limit, choose the nearest safe semantic boundary rather than splitting arbitrarily.
 
 
 ## Anti-patterns
