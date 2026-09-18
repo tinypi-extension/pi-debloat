@@ -191,14 +191,11 @@ export async function runCompactCheckpoint(
         ...newTitles,
       ];
       const members = spanEntries(entries, span.fromAfterEntryId, span.toAfterEntryId);
-      const userPrompt = [
-        spanPreamble(span, earlierTitles),
-        "",
-        // The compactor needs full fidelity (commands, paths), so it gets the wide budget.
-        formatTranscript(members, { maxCharsPerEntry: COMPACT_MAX_CHARS_PER_ENTRY }),
-      ].join(
-        "\n",
-      );
+      // The compactor needs full fidelity (commands, paths), so it gets the wide budget.
+      const originalText = formatTranscript(members, {
+        maxCharsPerEntry: COMPACT_MAX_CHARS_PER_ENTRY,
+      });
+      const userPrompt = [spanPreamble(span, earlierTitles), "", originalText].join("\n");
 
       const result = await requestJson(
         caller.call,
@@ -211,6 +208,14 @@ export async function runCompactCheckpoint(
           "error",
         );
         return;
+      }
+
+      if (result.value.summary.length > originalText.length) {
+        ctx.ui.notify(
+          `Debloat: compacting span "${span.fromLabel}" → "${span.toLabel}" was skipped because the summary is longer than the original text.`,
+          "warning",
+        );
+        continue;
       }
 
       pi.appendEntry(COMPACTION_CUSTOM_TYPE, {
